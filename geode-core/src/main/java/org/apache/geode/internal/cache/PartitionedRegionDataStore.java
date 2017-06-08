@@ -1417,6 +1417,39 @@ public class PartitionedRegionDataStore implements HasCachePerfStats {
     }
   }
 
+  public boolean isRemotePrimaryReadyForColocatedChildren(int bucketId) {
+    boolean isRemotePrimaryReady = true;
+    InternalDistributedMember myId =
+        this.partitionedRegion.getDistributionManager().getDistributionManagerId();
+
+    List<PartitionedRegion> colocatedChildPRs =
+        ColocationHelper.getColocatedChildRegions(this.partitionedRegion);
+    if (colocatedChildPRs != null) {
+      for (PartitionedRegion pr : colocatedChildPRs) {
+        InternalDistributedMember primaryChild = pr.getBucketPrimary(bucketId);
+        if (logger.isDebugEnabled()) {
+          logger.debug("Checking colocated child bucket " + pr + ", bucketId=" + bucketId
+              + ", primary is " + primaryChild);
+        }
+        if (primaryChild == null || myId.equals(primaryChild)) {
+          if (logger.isDebugEnabled()) {
+            logger.debug("Colocated bucket region " + pr + " " + bucketId
+                + " does not have a remote primary yet. Not to remove.");
+          }
+          return false;
+        } else {
+          if (logger.isDebugEnabled()) {
+            logger
+                .debug(pr + " bucketId=" + bucketId + " has remote primary, checking its children");
+          }
+          isRemotePrimaryReady = isRemotePrimaryReady
+              && pr.getDataStore().isRemotePrimaryReadyForColocatedChildren(bucketId);
+        }
+      }
+    }
+    return isRemotePrimaryReady;
+  }
+
   /**
    * Removes a redundant bucket hosted by this data store. The rebalancer invokes this method
    * directly or sends this member a message to invoke it.
@@ -1471,7 +1504,11 @@ public class PartitionedRegionDataStore implements HasCachePerfStats {
 
       }
 
+      PartitionedRegion leader = ColocationHelper.getLeaderRegion(this.partitionedRegion);
+      boolean isLeader = leader.equals(this.partitionedRegion);
       BucketAdvisor bucketAdvisor = bucketRegion.getBucketAdvisor();
+      InternalDistributedMember myId =
+          this.partitionedRegion.getDistributionManager().getDistributionManagerId();
       Lock writeLock = bucketAdvisor.getActiveWriteLock();
 
       // Fix for 43613 - don't remove the bucket
@@ -1482,6 +1519,25 @@ public class PartitionedRegionDataStore implements HasCachePerfStats {
       try {
         if (!forceRemovePrimary && bucketAdvisor.isPrimary()) {
           return false;
+        }
+
+        if (isLeader) {
+          if (!isRemotePrimaryReadyForColocatedChildren(bucketId)) {
+            return false;
+          }
+
+          InternalDistributedMember primary = bucketAdvisor.getPrimary();
+          if (primary == null || myId.equals(primary)) {
+            if (logger.isDebugEnabled()) {
+              logger.debug("Bucket region " + bucketRegion
+                  + " does not have a remote primary yet. Not to remove.");
+            }
+            return false;
+          }
+
+          if (logger.isDebugEnabled()) {
+            logger.debug("Bucket region " + bucketRegion + " has primary at " + primary);
+          }
         }
 
         // recurse down to each tier of children to remove first
@@ -1513,8 +1569,6 @@ public class PartitionedRegionDataStore implements HasCachePerfStats {
       // because it won't block write operations while we're trying to acquire
       // the activePrimaryMoveLock
       InternalDistributedMember primary = bucketAdvisor.getPrimary();
-      InternalDistributedMember myId =
-          this.partitionedRegion.getDistributionManager().getDistributionManagerId();
       if (!myId.equals(primary)) {
         StateFlushOperation flush = new StateFlushOperation(bucketRegion);
         int executor = DistributionManager.WAITING_POOL_EXECUTOR;
